@@ -10,7 +10,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-
+from pathlib import Path
+import shutil
+from fastapi import UploadFile, File
+from rag.ingestion import ingest_pdf
 from agent.orchestrator import AgentOrchestrator
 from core.config import ROOT, get_mcp_server_url
 from core.mcp_client import MCPClient
@@ -85,6 +88,60 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
 
 client_dir = ROOT / "client"
+UPLOAD_DIR = ROOT / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+@app.post("/ingest")
+async def ingest_document(
+    file: UploadFile = File(...)
+) -> dict[str, Any]:
+
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF files are supported"
+        )
+
+    pdf_path = UPLOAD_DIR / file.filename
+
+
+    try:
+
+        # Save uploaded file
+        with pdf_path.open("wb") as buffer:
+            shutil.copyfileobj(
+                file.file,
+                buffer
+            )
+
+
+        # Run RAG ingestion pipeline
+        result = await ingest_pdf(
+            str(pdf_path)
+        )
+
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Ingestion failed: {exc}"
+        ) from exc
+
+
+    finally:
+
+        await file.close()
+
+
+    return {
+        "status": "success",
+        "filename": file.filename,
+        "message": "Document ingested successfully",
+        "result": result
+    }
+    
+    
 app.mount("/static", StaticFiles(directory=client_dir), name="static")
 
 
