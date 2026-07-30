@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from typing import Any
 
 from dotenv import load_dotenv
@@ -13,29 +12,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from agent.orchestrator import AgentOrchestrator
-from core.config import ROOT, load_server_config
-from core.mcp_manager import MCPManager
+from core.config import ROOT, get_mcp_server_url
+from core.mcp_client import MCPClient
 
 load_dotenv(ROOT / ".env")
 
-manager: MCPManager | None = None
-
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    global manager
-    config = load_server_config()
-    manager = MCPManager(config)
-    await manager.__aenter__()
-    yield
-    await manager.__aexit__(None, None, None)
-    manager = None
-
-
 app = FastAPI(
     title="AI Platform",
-    description="AI platform with a single MCP server and tool-routing agent",
-    lifespan=lifespan,
+    description="FastAPI agent that talks to a remote MCP server over Streamable HTTP",
 )
 
 app.add_middleware(
@@ -65,26 +49,31 @@ class ChatResponse(BaseModel):
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "mcp_server_url": get_mcp_server_url()}
 
 
 @app.get("/platform")
 async def platform_info() -> dict[str, Any]:
-    if manager is None:
-        raise HTTPException(status_code=503, detail="Platform not ready")
-    return {
-        "server": manager.describe_platform(),
-        "tool_count": len(manager.tools),
-    }
+    client = MCPClient()
+    try:
+        server = await client.describe_platform()
+        tools = await client.list_tools()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"MCP server unavailable at {client.url}: {exc}",
+        ) from exc
+    return {"server": server, "tool_count": len(tools)}
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
-    if manager is None:
-        raise HTTPException(status_code=503, detail="Platform not ready")
+    try:
+        orchestrator = await AgentOrchestrator.create()
+        result = await orchestrator.run(request.message)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    orchestrator = AgentOrchestrator(manager)
-    result = await orchestrator.run(request.message)
     return ChatResponse(
         answer=result.answer,
         tool_calls=[

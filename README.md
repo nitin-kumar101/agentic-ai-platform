@@ -1,95 +1,61 @@
 # AI Platform
 
-An AI platform with a **single MCP server** and a client-side agent that routes user queries to the right tools — or chains several tools in sequence.
+FastAPI agent + **separate MCP server** over Streamable HTTP.
 
 ## Architecture
 
 ```
-┌─────────────┐     HTTP      ┌──────────────────┐
-│ Web Client  │ ────────────► │  FastAPI Backend │
-│ (agent UI)  │ ◄──────────── │  /chat /platform │
-└─────────────┘               └────────┬─────────┘
-                                       │
-                              ┌────────▼─────────┐
-                              │ AgentOrchestrator│  ← OpenAI function calling
-                              │  (ReAct loop)    │
-                              └────────┬─────────┘
-                                       │
-                              ┌────────▼─────────┐
-                              │   MCPManager     │
-                              └────────┬─────────┘
-                                       │
-                              ┌────────▼─────────┐
-                              │  MCP Server      │  math + web + file tools
-                              │  mcp_servers/    │
-                              │  server.py       │
-                              └──────────────────┘
+Terminal 1                         Terminal 2
+python run_mcp.py                  python run.py
+     │                                  │
+     ▼                                  ▼
+MCP Server                      FastAPI (port 8000)
+http://127.0.0.1:8001/mcp  ◄────  MCPClient (HTTP)
+     │
+  mcp_servers/server.py
+  (all tools)
 ```
 
-### Components
-
-| Layer | Role |
-|-------|------|
-| `mcp_servers/server.py` | Single MCP server with all tools |
-| `core/mcp_manager.py` | Connects to the MCP server and exposes tools to the agent |
-| `agent/orchestrator.py` | LLM agent that picks one tool or a tool chain per query |
-| `api/main.py` | REST API + serves the web client |
-| `client/` | Browser UI showing answers and tool traces |
+- **MCP server** runs on its own port (`8001`) in Streamable HTTP mode
+- **FastAPI** runs on port `8000` and talks to the MCP server via `MCP_SERVER_URL`
+- No in-process MCPManager — the agent connects over HTTP for each tool call
 
 ## Quick start
 
 ```powershell
 cd ai-platform
-python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 copy .env.example .env
-# Edit .env and set OPENAI_API_KEY
+# Set GROQ_API_KEY in .env
+```
+
+**Terminal 1 — start MCP server:**
+```powershell
+python run_mcp.py
+```
+
+**Terminal 2 — start FastAPI:**
+```powershell
 python run.py
 ```
 
 Open http://localhost:8000
 
-## Example queries
+## Environment
 
-- **Single tool:** `What is 144 divided by 12?` → routes to `divide`
-- **Tool chain:** `Search for MCP protocol and write a summary to notes/mcp.txt` → `search_web` then `write_file`
-- **Multi-step:** `Calculate 2^10 and save the result to result.txt` → `power` then `write_file`
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `GROQ_API_KEY` | — | Groq API key for the agent |
+| `GROQ_MODEL` | `llama-3.1-8b-instant` | Groq model |
+| `MCP_HOST` | `127.0.0.1` | MCP server bind host |
+| `MCP_PORT` | `8001` | MCP server port |
+| `MCP_SERVER_URL` | `http://127.0.0.1:8001/mcp` | URL FastAPI uses to reach MCP |
+| `API_PORT` | `8000` | FastAPI port |
 
-## Add more tools
-
-Edit `mcp_servers/server.py` and add new functions with `@mcp.tool()`. Restart the platform — tools appear automatically.
-
-## API
-
-### `GET /platform`
-Returns the connected MCP server and its tools.
-
-### `POST /chat`
-```json
-{ "message": "your question" }
-```
-
-Response:
-```json
-{
-  "answer": "final natural language answer",
-  "tool_calls": [
-    { "tool": "multiply", "arguments": {"a": 15, "b": 23}, "result": "345" }
-  ],
-  "iterations": 2
-}
-```
-
-## Configuration
-
-- `config/mcp_servers.yaml` — MCP server config (in-memory or stdio transport)
-- `.env` — `OPENAI_API_KEY`, optional `OPENAI_MODEL`, `API_PORT`
-
-## Run MCP server standalone (stdio)
+## CLI agent
 
 ```powershell
-python -m mcp_servers.server
+python run_mcp.py          # terminal 1
+python -m agent.cli        # terminal 2
 ```
-
-Use this for Claude Desktop / Cursor MCP config.

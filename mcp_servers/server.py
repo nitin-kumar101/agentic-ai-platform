@@ -3,25 +3,18 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote_plus
 
 import httpx
 from mcp.server import MCPServer
-from pathlib import Path
-import pandas as pd
-import os
-import matplotlib.pyplot as plt
-# from datetime import parse
 
-try:
-    from prophet import Prophet
-except ImportError:
-    raise ImportError(
-        "Please install Prophet first:\n"
-        "pip install prophet"
-    )
-import logging
+if TYPE_CHECKING:
+    import asyncpg
+    from openai import AsyncOpenAI
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,9 +27,6 @@ WORKSPACE = Path(__file__).resolve().parent.parent / "workspace"
 WORKSPACE.mkdir(exist_ok=True)
 
 logger.info("Workspace initialized at %s", WORKSPACE)
-
-WORKSPACE = Path(__file__).resolve().parent.parent / "workspace"
-WORKSPACE.mkdir(exist_ok=True)
 
 mcp = MCPServer(
     "ai-platform-server",
@@ -169,7 +159,6 @@ def summarize_json(json_text: str) -> str:
 
 # --- File tools ---
 
-
 @mcp.tool(title="List files")
 def list_files(subdirectory: str = ".") -> list[str]:
     """List files under a workspace subdirectory."""
@@ -210,28 +199,182 @@ def delete_file(path: str) -> dict[str, str]:
     target.unlink()
     return {"deleted": path}
 
+
+# --- RAG retrieval tool (pgvector hybrid search) ---
+#
+# Expected table schema (adjust column names below if yours differ):
+#   id         any unique type (uuid/bigint/text)
+#   content    text                -- the chunk text
+#   embedding  vector(N)           -- pgvector column, N must match EMBEDDING_MODEL's dims
+#   source     text     (optional) -- e.g. filename/URL the chunk came from
+#   metadata   jsonb    (optional)
+#
+# Recommended indexes for performance at scale:
+#   CREATE INDEX ON <table> USING hnsw (embedding vector_cosine_ops);
+#   CREATE INDEX ON <table> USING gin (to_tsvector('english', content));
+#
+# Required env vars: DATABASE_URL (postgres DSN), OPENAI_API_KEY (for query embedding).
+# Required packages: asyncpg, pgvector, openai
+
+EMBEDDING_MODEL = os.environ.get("RAG_EMBEDDING_MODEL", "text-embedding-3-small")
+
+_pg_pool: Any = None
+_openai_client: Any = None
+
+
+async def _get_pg_pool() -> "asyncpg.Pool":
+    """Lazily create (once) and return a shared asyncpg connection pool
+    with the pgvector type codec registered on every connection."""
+    global _pg_pool
+    if _pg_pool is None:
+        try:
+            import asyncpg
+            from pgvector.asyncpg import register_vector
+        except ImportError as exc:
+            raise ImportError(
+                "RAG tools require: pip install asyncpg pgvector"
+            ) from exc
+
+        dsn = os.environ.get("DATABASE_URL")
+        if not dsn:
+            raise RuntimeError("DATABASE_URL environment variable is not set")
+
+        async def _init_connection(conn: "asyncpg.Connection") -> None:
+            await register_vector(conn)
+
+        _pg_pool = await asyncpg.create_pool(
+            dsn=dsn, min_size=1, max_size=5, init=_init_connection
+        )
+        logger.info("Postgres connection pool created")
+    return _pg_pool
+
+
+def _get_openai_client() -> "AsyncOpenAI":
+    global _openai_client
+    if _openai_client is None:
+        try:
+            from openai import AsyncOpenAI
+        except ImportError as exc:
+            raise ImportError(
+                "RAG tools require: pip install openai"
+            ) from exc
+
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY environment variable is not set")
+        _openai_client = AsyncOpenAI(api_key=api_key)
+    return _openai_client
+
+
+async def _embed_query(text: str) -> list[float]:
+    client = _get_openai_client()
+    response = await client.embeddings.create(model=EMBEDDING_MODEL, input=text)
+    return response.data[0].embedding
+
+
+@mcp.tool(title="Retrieve chunks (hybrid search)")
+async def retrieve_chunks(
+    query: str,
+    table: str = "document_chunks",
+    top_k: int = 5,
+    rrf_k: int = 60,
+) -> list[dict[str, str]]:
+    """Retrieve the most relevant text chunks for a query from a
+    pgvector-backed Postgres table using hybrid search.
+
+    Combines two signals and fuses them with Reciprocal Rank Fusion (RRF):
+      - semantic similarity: cosine distance between the query embedding
+        and each row's `embedding` column (pgvector `<=>` operator)
+      - keyword relevance: Postgres full-text search rank on `content`
+
+    A chunk that ranks well on either signal (or both) rises to the top,
+    which tends to beat pure vector search on queries containing exact
+    terms, IDs, or names, and beats pure keyword search on queries that
+    are paraphrased or conceptual.
+
+    Args:
+        query: Natural-language search query.
+        table: Name of the pgvector table to search (must contain
+            id, content, embedding, and optionally source/metadata columns).
+        top_k: Number of chunks to return.
+        rrf_k: RRF smoothing constant (higher = flatter score distribution
+            across ranks; 60 is the commonly used default).
+    """
+    if not table.replace("_", "").isalnum():
+        # Table names can't be parameterized via SQL placeholders, so guard
+        # against injection with a strict allow-list check instead.
+        raise ValueError("Invalid table name")
+
+    logger.info("Hybrid retrieval on table=%s query=%r top_k=%d", table, query, top_k)
+
+    embedding = await _embed_query(query)
+    pool = await _get_pg_pool()
+
+    sql = f"""
+        WITH semantic_search AS (
+            SELECT id, content, source, metadata,
+                   RANK() OVER (ORDER BY embedding <=> $1) AS rank
+            FROM {table}
+            ORDER BY embedding <=> $1
+            LIMIT $2
+        ),
+        keyword_search AS (
+            SELECT id, content, source, metadata,
+                   RANK() OVER (
+                       ORDER BY ts_rank_cd(to_tsvector('english', content),
+                                           plainto_tsquery('english', $3)) DESC
+                   ) AS rank
+            FROM {table}
+            WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $3)
+            LIMIT $2
+        )
+        SELECT
+            COALESCE(s.id, k.id) AS id,
+            COALESCE(s.content, k.content) AS content,
+            COALESCE(s.source, k.source) AS source,
+            COALESCE(s.metadata, k.metadata) AS metadata,
+            (COALESCE(1.0 / ($4 + s.rank), 0.0) + COALESCE(1.0 / ($4 + k.rank), 0.0)) AS score
+        FROM semantic_search s
+        FULL OUTER JOIN keyword_search k ON s.id = k.id
+        ORDER BY score DESC
+        LIMIT $2;
+    """
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, embedding, top_k, query, rrf_k)
+
+    results = [
+        {
+            "id": str(row["id"]),
+            "content": row["content"],
+            "source": row["source"] or "",
+            "metadata": json.dumps(row["metadata"]) if row["metadata"] is not None else "{}",
+            "score": f"{row['score']:.6f}",
+        }
+        for row in rows
+    ]
+    logger.info("Retrieved %d chunks", len(results))
+    return results
+
+
 def parse_datetime_column(series):
+    import pandas as pd
+
     try:
-        # Fast path for Pandas >= 2.0
         parsed = pd.to_datetime(
             series,
             format="mixed",
             dayfirst=True,
-            errors="coerce"
+            errors="coerce",
         )
     except Exception:
-        # Fallback for older Pandas versions
-        parsed = series.apply(
-            lambda x: parse(str(x), dayfirst=True)
-            if pd.notna(x) else pd.NaT
-        )
+        parsed = pd.to_datetime(series, dayfirst=True, errors="coerce")
 
     invalid = parsed.isna().sum()
-
     if invalid:
         print(f"Skipped {invalid} rows due to invalid datetime values.")
-
     return parsed
+
 
 @mcp.tool(title="Forecast timeseries")
 def forecast_timeseries(
@@ -240,9 +383,16 @@ def forecast_timeseries(
     output_csv: str = "forecast.csv",
     plot: bool = True,
 ):
-    """
-    Forecast future values from a CSV file.
-    """
+    """Forecast future values from a CSV file."""
+    try:
+        import matplotlib.pyplot as plt
+        import pandas as pd
+        from prophet import Prophet
+    except ImportError as exc:
+        raise ImportError(
+            "Forecast tool requires: pip install pandas matplotlib prophet"
+        ) from exc
+
     csv_path = Path(csv_path)
 
     if not csv_path.exists():
@@ -377,14 +527,8 @@ def forecast_timeseries(
 
 
 if __name__ == "__main__":
+    import os
 
-    forecast = forecast_timeseries(
-        csv_path="sample.csv",
-        forecast_periods=30,
-        output_csv="forecast.csv",
-        plot=True,
-    )
-
-    print(forecast.tail())
-# if __name__ == "__main__":
-#     mcp.run()
+    host = os.getenv("MCP_HOST", "127.0.0.1")
+    port = int(os.getenv("MCP_PORT", "8001"))
+    mcp.run(transport="streamable-http", host=host, port=port, stateless_http=True)
