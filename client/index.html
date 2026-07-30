@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Platform</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <h1>AI Platform</h1>
+      <p class="subtitle">MCP-powered multi-tool agent</p>
+      <section id="platform-info">
+        <h2>MCP Server</h2>
+        <div id="servers" class="servers"></div>
+      </section>
+      <section class="examples">
+        <h2>Try these</h2>
+        <button class="example" data-query="What is 15 multiplied by 23?">Math calculation</button>
+        <button class="example" data-query="Search the web for Model Context Protocol and summarize what you find.">Web search chain</button>
+        <button class="example" data-query="Write a file notes/todo.txt with three tasks for building an MCP platform, then read it back.">File write + read chain</button>
+      </section>
+    </aside>
+
+    <main class="chat">
+      <div id="messages" class="messages"></div>
+      <form id="chat-form" class="composer">
+        <textarea id="input" rows="2" placeholder="Ask anything — the agent will pick the right MCP tools..."></textarea>
+        <button type="submit" id="send-btn">Send</button>
+      </form>
+    </main>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

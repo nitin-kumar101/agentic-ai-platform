@@ -1,0 +1,15 @@
+# Single MCP server configuration
+servers:
+  - id: platform
+    name: AI Platform Server
+    description: Math, web search, and file tools in one MCP server
+    transport: in_memory
+    module: mcp_servers.server
+    attr: mcp
+
+# Example stdio transport (run server as subprocess):
+#  - id: platform
+#    name: AI Platform Server
+#    transport: stdio
+#    command: python
+#    args: ["-m", "mcp_servers.server"]
