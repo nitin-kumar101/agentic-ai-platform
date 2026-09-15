@@ -13,10 +13,11 @@ from pydantic import BaseModel, Field
 from pathlib import Path
 import shutil
 from fastapi import UploadFile, File
-from rag.ingestion import ingest_pdf
+from rag.ingest import ingest_pdf
 from agent.orchestrator import AgentOrchestrator
 from core.config import ROOT, get_mcp_server_url
 from core.mcp_client import MCPClient
+from api.router.timeseries_upload import router as timeseries_router
 
 load_dotenv(ROOT / ".env")
 
@@ -24,7 +25,7 @@ app = FastAPI(
     title="AI Platform",
     description="FastAPI agent that talks to a remote MCP server over Streamable HTTP",
 )
-
+app.include_router(timeseries_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

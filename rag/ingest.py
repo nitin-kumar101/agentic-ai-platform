@@ -1,231 +1,92 @@
+from __future__ import annotations
+
 import os
-import json
-import pdfplumber
-import asyncpg
+from pathlib import Path
 
-from openai import AsyncOpenAI
-from pgvector.asyncpg import register_vector
+from rag.vector_store import ChunkRecord, DEFAULT_COLLECTION, get_vector_store
 
+EMBEDDING_MODEL = os.getenv("RAG_EMBEDDING_MODEL", "text-embedding-3-small")
 
-EMBEDDING_MODEL = os.getenv(
-    "RAG_EMBEDDING_MODEL",
-    "text-embedding-3-small"
-)
+_openai_client = None
 
 
-DATABASE_URL = os.environ["DATABASE_URL"]
+def _get_openai_client():
+    global _openai_client
+    if _openai_client is None:
+        from openai import AsyncOpenAI
 
-_openai_client = AsyncOpenAI(
-    api_key=os.environ["OPENAI_API_KEY"]
-)
-
-
-# -------------------------------
-# PostgreSQL Connection
-# -------------------------------
-
-async def create_pool():
-
-    async def init_connection(conn):
-        await register_vector(conn)
-
-    pool = await asyncpg.create_pool(
-        DATABASE_URL,
-        min_size=1,
-        max_size=5,
-        init=init_connection
-    )
-
-    return pool
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY environment variable is not set")
+        _openai_client = AsyncOpenAI(api_key=api_key)
+    return _openai_client
 
 
-
-# -------------------------------
-# PDF Extraction
-# -------------------------------
-
-def extract_pdf_text(pdf_path: str):
+def extract_pdf_text(pdf_path: str) -> list[dict]:
+    import pdfplumber
 
     pages = []
-
     with pdfplumber.open(pdf_path) as pdf:
-
         for page_number, page in enumerate(pdf.pages, start=1):
-
             text = page.extract_text()
-
             if text:
-
-                pages.append(
-                    {
-                        "page": page_number,
-                        "text": text
-                    }
-                )
-
+                pages.append({"page": page_number, "text": text})
     return pages
 
 
-
-# -------------------------------
-# Text Chunking
-# -------------------------------
-
-def chunk_text(
-    text,
-    chunk_size=1000,
-    overlap=200
-):
-
+def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> list[str]:
     chunks = []
-
     start = 0
-
     while start < len(text):
-
         end = start + chunk_size
-
-        chunk = text[start:end]
-
-        chunks.append(chunk)
-
+        chunks.append(text[start:end])
         start = end - overlap
-
-
+        if start >= len(text):
+            break
+        if overlap >= chunk_size:
+            start = end
     return chunks
 
 
-
-# -------------------------------
-# Embedding Generation
-# -------------------------------
-
-async def create_embedding(text):
-
-    response = await _openai_client.embeddings.create(
+async def create_embedding(text: str) -> list[float]:
+    response = await _get_openai_client().embeddings.create(
         model=EMBEDDING_MODEL,
-        input=text
+        input=text,
     )
-
     return response.data[0].embedding
 
 
-
-# -------------------------------
-# Insert into PostgreSQL
-# -------------------------------
-
-async def insert_chunk(
-    pool,
-    content,
-    embedding,
-    source,
-    metadata
-):
-
-    async with pool.acquire() as conn:
-
-        await conn.execute(
-            """
-            INSERT INTO document_chunks
-            (
-                content,
-                source,
-                metadata,
-                embedding
-            )
-            VALUES
-            ($1,$2,$3,$4)
-            """,
-
-            content,
-            source,
-            json.dumps(metadata),
-            embedding
-        )
-
-
-
-# -------------------------------
-# Main ingestion pipeline
-# -------------------------------
-
-async def ingest_pdf(pdf_path):
-
-    pool = await create_pool()
-
-
+async def ingest_pdf(
+    pdf_path: str,
+    table: str = DEFAULT_COLLECTION,
+) -> dict:
+    store = get_vector_store()
     pages = extract_pdf_text(pdf_path)
-
-
-    total_chunks = 0
-
+    source = Path(pdf_path).name
+    records: list[ChunkRecord] = []
 
     for page in pages:
-
-
-        chunks = chunk_text(
-            page["text"]
-        )
-
-
+        chunks = chunk_text(page["text"])
         for index, chunk in enumerate(chunks):
-
-            embedding = await create_embedding(
-                chunk
+            embedding = await create_embedding(chunk)
+            records.append(
+                ChunkRecord(
+                    content=chunk,
+                    embedding=embedding,
+                    source=source,
+                    metadata={"page": page["page"], "chunk_number": index},
+                )
             )
 
+    written = await store.upsert(records, table=table)
+    return {
+        "backend": store.name,
+        "table": table,
+        "total_chunks": written,
+    }
 
-            metadata = {
-
-                "page": page["page"],
-
-                "chunk_number": index
-
-            }
-
-
-            await insert_chunk(
-
-                pool,
-
-                content=chunk,
-
-                embedding=embedding,
-
-                source=pdf_path,
-
-                metadata=metadata
-            )
-
-
-            total_chunks += 1
-
-
-            print(
-                f"Inserted chunk {total_chunks}"
-            )
-
-
-    await pool.close()
-
-
-    print(
-        f"Completed ingestion. Total chunks={total_chunks}"
-    )
-
-
-
-# -------------------------------
-# Run
-# -------------------------------
 
 if __name__ == "__main__":
-
     import asyncio
 
-    asyncio.run(
-        ingest_pdf(
-            "sample.pdf"
-        )
-    )
+    asyncio.run(ingest_pdf("sample.pdf"))

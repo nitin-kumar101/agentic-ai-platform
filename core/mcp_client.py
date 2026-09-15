@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
-from mcp import Client
 from mcp.types import TextContent
 
 from core.config import get_mcp_server_url
+
+try:
+    from mcp import Client as MCPHttpClient
+except ImportError:
+    MCPHttpClient = None  # type: ignore[misc, assignment]
 
 
 @dataclass
@@ -20,6 +26,24 @@ class RegisteredTool:
     input_schema: dict[str, Any]
 
 
+@asynccontextmanager
+async def _mcp_session(url: str) -> AsyncIterator[Any]:
+    """Open an MCP session for mcp 2.x (`Client`) or 1.x (streamable HTTP)."""
+    if MCPHttpClient is not None:
+        async with MCPHttpClient(url) as session:
+            yield session
+        return
+
+    from mcp.client.session import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    async with streamablehttp_client(url) as streams:
+        read, write = streams[0], streams[1]
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            yield session
+
+
 class MCPClient:
     """Stateless client for an MCP server running on Streamable HTTP."""
 
@@ -27,12 +51,12 @@ class MCPClient:
         self.url = url or get_mcp_server_url()
 
     async def list_tools(self) -> list[RegisteredTool]:
-        async with Client(self.url) as client:
-            result = await client.list_tools()
+        async with _mcp_session(self.url) as session:
+            result = await session.list_tools()
             return [
                 RegisteredTool(
                     name=tool.name,
-                    title=tool.title,
+                    title=getattr(tool, "title", None),
                     description=tool.description,
                     input_schema=tool.input_schema,
                 )
@@ -56,14 +80,15 @@ class MCPClient:
         return openai_tools
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any] | None = None) -> str:
-        async with Client(self.url) as client:
-            result = await client.call_tool(tool_name, arguments or {})
+        async with _mcp_session(self.url) as session:
+            result = await session.call_tool(tool_name, arguments or {})
 
-        if result.is_error:
+        if getattr(result, "is_error", False):
             return self._content_to_text(result.content)
 
-        if result.structured_content is not None:
-            return json.dumps(result.structured_content, indent=2)
+        structured = getattr(result, "structured_content", None)
+        if structured is not None:
+            return json.dumps(structured, indent=2)
 
         return self._content_to_text(result.content)
 

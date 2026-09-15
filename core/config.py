@@ -15,5 +15,9 @@ def get_mcp_server_url() -> str:
 def get_groq_settings() -> dict[str, str]:
     return {
         "api_key": os.getenv("GROQ_API_KEY", ""),
-        "model": os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+        "model": os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
     }
+
+
+def get_vector_store_name() -> str:
+    return os.getenv("VECTOR_STORE", "chroma").strip().lower()

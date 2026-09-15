@@ -52,6 +52,23 @@ Open http://localhost:8000
 | `MCP_PORT` | `8001` | MCP server port |
 | `MCP_SERVER_URL` | `http://127.0.0.1:8001/mcp` | URL FastAPI uses to reach MCP |
 | `API_PORT` | `8000` | FastAPI port |
+| `VECTOR_STORE` | `chroma` | RAG backend: `chroma` or `postgres` |
+| `CHROMA_PERSIST_DIR` | `rag/chroma_data` | Local Chroma persist path |
+| `OPENAI_API_KEY` | — | Embeddings for ingest + retrieval |
+| `DATABASE_URL` | — | Postgres DSN (only if `VECTOR_STORE=postgres`) |
+
+## Vector store
+
+Default is **Chroma** (local files, no database server). Ingested PDFs are stored under `rag/chroma_data`.
+
+To use **PostgreSQL + pgvector** instead, set:
+
+```
+VECTOR_STORE=postgres
+DATABASE_URL=postgresql://user:password@localhost:5432/ai_platform
+```
+
+The `document_chunks` table must already exist with `content`, `source`, `metadata`, and `embedding` columns.
 
 ## CLI agent
 
